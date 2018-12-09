@@ -1,0 +1,67 @@
+Mark Petersen
+
+Brief Overview: Fine grain locking involves not only locking up the global mutex, but also locking upindividual nodes when appropriate. The core paradigm
+  applied here (as discussed in the attached book "The Art of Multiprocessor Programming" by Herlihy and Shavit) is "hand-over-hand" locking. This was the
+  primary paradigm used in this implementation of fine-grain locking. When traversing through the list in general, we want to ensure we maintain two ongoing
+  locks, which we can call Lock 1 (the first lock) and Lock 2 (the second/next lock). We want to unlock Lock 1, reassign our last and current nodes forward,
+  then lock the "new" cursor. Essentially, Lock 1 is unlocked, Lock 2 becomes Lock 1, and the new Lock 2 is the next node in the list. The only exception to
+  this rule are edge cases, which are described in more detail below. However, this is the general paradigm that we follow in this implementation of fine-grain.
+  Because "fine-lru" is a subset of "mutex-lru" we do not descibe mutex-lru here, as "fine-lru" already covers everything we implemented in "mutex-lru" and then some.
+
+NOTE: My fine grain locking implementation works through the entire test case and gets stuck into some kind of loop and won't terminate once the salt is
+      printed... I'm not quite sure why this is the case and I have spent too much time trying to figure out what's wrong, but my guess is there's some
+      second thread being created somewhere that is messing it up. When I test in gdb and walk through it line by line, then it works perfectly for some reason,
+      so I'm not sure if this is because a thread is allowed time to complete in gdb. In any case, the self-tests are at least working fine and salt is able to
+      print out so I feel as though my implementation is fairly robust. I wanted to add this note just as a disclaimer! :)
+
+init(int numthreads):
+    Here we are simply initializing our mutexes (global mutex and 2 mutexes for condition variables) and catching errors should they occur.
+
+reference(int key):
+    Initial cases:
+        We start off by locking up the global mutex for the condition variables, as per rule #3 of the attached basic thread programming rules
+        (holding a lock when utilizing condition variables). In the initial case, list_head is null so we go right ahead and skip the while loop
+        and initialize this new mutex. Now that we have a list head, whenever we call reference, we lock up the list head. If we want to insert a
+        new node at the beginning of the list, our last node will be null, so we are only mainting one lock (current) in this case.
+    General case:
+        Once we move away from the beginning of the list, we have our simple two-lock paradigm. Iterating through the while loop, we maintain this
+        paradigm by first unlocking Lock 1, reassinging previous and current, then adding a lock to our new current. We continue this way so that
+        we are maximizing our concurrent thread functionality while perserving safety by holding a lock at all times. When we are at the beginning
+        or reach the end of the list, we check for nulls, at which point we end up with one lock. From here, we fall into an edge case.
+    Edge cases:
+        If we want to insert a new node at the end of the list, we traverse through the whole list in our above-mentioned technique, then end up
+        with current == null, which is where we want to insert our new node. Thus, we only end up with one lock (previous) when we go to insert this
+        new node. In general, anytime we go to insert/initialize a new node, there is at most one lock, as either previous node, current node, or
+        nodes will equal null.
+
+Clean:
+    General case:
+        The most common case is simply decrementing a reference count. In this case, after we lock up the global mutex and lock the list head, we
+        unlock the mutex. We go into the while loop with a single lock. From here, we will most often find ourselves in the "else" clause of the
+        if-else. This is identical to our code and reasoning for reference, as we are simply traversing through the list while maintaing the
+        two-lock paradigm.
+    Deleting an element/ending:
+        In the case that a reference count drops to 0 and we need to delete that node, we have a couple cases to consider. We could either have
+        2 locks (common case, middle of list), or 1 lock (beginning of list, previous is null). In the case where we do have a lock on previous,
+        then previous is not null, so our first "if" clause will release its lock after reassignment so that other threads can access last and make
+        progress in their executions. In our "else" clause, last is null so we don't need to unlock it. From here, tmp is going to be our next node
+        to consider in our list, so we initialize tmp to follow cursor. If tmp is null, then we are at the end of the list, so no longer need to lock.
+        In the general case, we are still traversing the list, so lock tmp and free cursor (which will effectively remove the lock that cursor had).
+        Now, we are sitting on potentially one lock on tmp (unless we are at the end of the list). We lock the global mutex for the non-atomical operation
+        of decrementing the count. Finally, if last is not null (i.e. we are not at the beginning of the list), then lock last and continue down the
+        list in our "hand-over-hand" locking paradigm. At the very end of clean, we can unlock the lock on last, then have a global lock for signaling
+        to reference if we have decremented below the high_water_mark.
+
+Condition variables:
+    These show up at the beginning and end of both reference and clean. We always want to acquire a global lock before jumping into these, so that we
+    are perserving safety. For reference, we are conditioning for when count is greater than high_water_mark. In this case, we want to continue waiting
+    until clean signals and releases the lock for cv_low. Until then, we need to wait because we don't want to increase the count anymore, since we are
+    already past our upper threshold. Looking at the end of clean, we see that the last thing we want to do is check if we have reached lower than our
+    high_water_mark, in which case we can signal to release the cv_low lock. This jumps back to reference, who can continue executing normally now that
+    we are in our desired count. This reasoning applies exactly the same for the end of reference and the beginning of clean, when we are below the
+    low_water_mark threshold. The only differnece here is that clean is waiting for the call from reference to release the lock once we have incremented
+    past our low_water_mark and clean can continue as normal.
+
+Shutdownthreads:
+    Here we are simply holding a global lock and broadcasting to our conditioning locks in case they are holding a lock. Here, we can clean everything up
+    and make sure that there are no lingering locks around.
